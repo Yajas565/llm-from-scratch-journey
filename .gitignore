@@ -6,3 +6,4 @@ __pycache__/
 pretraining/notebooks/gpt2/
 pretraining/notebooks/*.pth
 finetuning/classification/notebooks/gpt2/
+finetuning/classification/notebooks/*.pth
