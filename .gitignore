@@ -7,3 +7,5 @@ pretraining/notebooks/gpt2/
 pretraining/notebooks/*.pth
 finetuning/classification/notebooks/gpt2/
 finetuning/classification/notebooks/*.pth
+finetuning/instruction_following/notebooks/gpt2/
+finetuning/instruction_following/notebooks/*.pth
