@@ -153,7 +153,7 @@ class GPTModel(nn.Module):
 
     def forward(self, x):
         batch_size, seq_len = x.shape
-        tok_embeds = self.tok_emb(x)
+        tok_embeds = self.tok_emb(x, device=x.device)
         pos_embeds = self.pos_emb(torch.arange(seq_len, device=x.device))
         x = tok_embeds + pos_embeds
         x = self.drop_emb(x)
