@@ -9,5 +9,5 @@ finetuning/classification/notebooks/gpt2/
 finetuning/classification/notebooks/*.pth
 finetuning/instruction_following/notebooks/gpt2/
 finetuning/instruction_following/notebooks/*.pth
-finetuning/instruction_following/notebooks/hugging_face_hub.ipynb
+finetuning/instruction_following/notebooks/hugging_face_hub/
 
