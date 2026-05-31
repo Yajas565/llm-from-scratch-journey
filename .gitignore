@@ -9,4 +9,6 @@ finetuning/classification/notebooks/gpt2/
 finetuning/classification/notebooks/*.pth
 finetuning/instruction_following/notebooks/gpt2/
 finetuning/instruction_following/notebooks/*.pth
+finetuning/preference_tuning_with_dpo/notebooks/gpt2/
+finetuning/preference_tuning_with_dpo/notebooks/*.pth
 
