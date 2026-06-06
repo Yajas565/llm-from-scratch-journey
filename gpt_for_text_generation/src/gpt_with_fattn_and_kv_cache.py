@@ -79,7 +79,7 @@ class MultiHeadAttention(nn.Module):
 
         if use_cache:
             if self.cache_k is None or self.cache_k.size(0) != b:
-                self.cache_k = torch.zeros((b,self.num_heads,num_tokens,self.head_dim), device=x.device)
+                self.cache_k = torch.zeros((b,self.num_heads,self.window_size,self.head_dim), device=x.device)
                 self.cache_v = torch.zeros_like(self.cache_k)
                 self.ptr_cur = 0
             
@@ -119,6 +119,87 @@ class MultiHeadAttention(nn.Module):
         context_vectors = (attention_dropout @ values).transpose(1,2)
 
         context_vectors = context_vectors.contiguous().view(b, num_tokens, self.d_out)
+        context_vectors = self.out_proj(context_vectors)
+
+        return context_vectors
+
+    def reset_cache(self):
+        self.cache_k, self.cache_v = None, None
+
+
+class MHAScaledDotProduct_with_KV_Cache(nn.Module):
+    def __init__(self, d_in, d_out, context_length, dropout, num_heads, qkv_bias=False, max_seq_len=None, window_size=None):
+        super().__init__()
+        assert(d_out % num_heads) == 0, "d_out must be divisible by num_heads"
+        
+        self.d_out = d_out
+        self.num_heads = num_heads
+        self.head_dim = d_out // num_heads
+
+        self.qkv = nn.Linear(d_in, 3 * d_out, bias=qkv_bias)
+
+        self.out_proj = nn.Linear(d_out, d_out, bias=qkv_bias)
+        self.dropout = nn.Dropout(dropout)
+
+        # kv cache
+        self.max_seq_len = max_seq_len or context_length
+        self.window_size = window_size or self.max_seq_len
+        self.register_buffer("cache_k", None, persistent=False)
+        self.register_buffer("cache_v", None, persistent=False)
+
+
+    def forward(self, x, use_cache=False):
+        b, num_tokens, d_in = x.shape
+
+        if use_cache:
+            assert num_tokens <= self.window_size, (f"input chunk size {num_tokens} exceeds the window size {self.window_size}")
+
+        qkv = self.qkv(x)
+        qkv = qkv.view(b, num_tokens, 3, self.num_heads, self.head_dim)
+
+        #(3, b, num_heads, num_tokens, head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        query, key, value = qkv
+
+        use_dropout = 0 if not self.training else self.dropout
+
+        if use_cache:
+            if self.cache_k is None or self.cache_k.size(0) != b:
+                self.cache_k = torch.zeros((b,self.num_heads,self.window_size,self.head_dim), device=x.device)
+                self.cache_v = torch.zeros_like(self.cache_k)
+                self.ptr_cur = 0
+            
+            if self.ptr_cur + num_tokens > self.window_size:
+                overflow = self.ptr_cur + num_tokens - self.window_size
+                self.cache_k[:, :, :-overflow, :] = self.cache_k[:, :, overflow:, :].clone()
+                self.cache_v[:, :, :-overflow, :] = self.cache_v[:, :, overflow:, :].clone()
+
+            self.cache_k[:, :, self.ptr_cur:self.ptr_cur+num_tokens, :] = key
+            self.cache_v[:, :, self.ptr_cur:self.ptr_cur+num_tokens, :] = value
+            self.ptr_cur += num_tokens
+
+            keys = self.cache_k[:, :, :self.ptr_cur, :]
+            values = self.cache_v[:, :, :self.ptr_cur, :]
+
+        else:
+            keys, values = key, value
+            self.ptr_cur = 0
+
+
+        k = keys.size(-2)
+
+        if num_tokens == k:
+            causal_mask = torch.triu(torch.ones((num_tokens, k), device=x.device, dtype=torch.bool), diagonal=1)
+            context_vectors = torch.nn.functional.scaled_dot_product_attention(query, keys, values, attn_mask=None, dropout_p=use_dropout, is_causal=True)
+        else:
+            offset = k - num_tokens
+            row_idx = torch.arange(num_tokens, device=x.device).unsqueeze(1)
+            col_idx = torch.arange(k, device=x.device).unsqueeze(0)
+            causal_mask = row_idx + offset < col_idx
+            context_vectors = torch.nn.functional.scaled_dot_product_attention(query, keys, values, attn_mask=causal_mask, dropout_p=use_dropout, is_causal=False)
+
+
+        context_vectors = context_vectors.transpose(1, 2).contiguous().view(b, num_tokens, self.d_out)
         context_vectors = self.out_proj(context_vectors)
 
         return context_vectors
@@ -184,6 +265,30 @@ class TransformerBlock(nn.Module):
         x = x + shortcut
         return x
 
+class TransformerBlock_kv_cache_and_flashattn(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.att = MHAScaledDotProduct_with_KV_Cache(d_in=cfg["emb_dim"], d_out=cfg["emb_dim"], context_length=cfg["context_length"], dropout=cfg["drop_rate"], num_heads=cfg["n_heads"], qkv_bias=cfg["qkv_bias"], window_size=cfg["kv_window_size"] if "kv_window_size" in cfg else cfg["context_length"])
+
+        self.ff = FeedForward(cfg)
+        self.norm1 = LayerNorm(emb_dim=cfg["emb_dim"])
+        self.norm2 = LayerNorm(emb_dim=cfg["emb_dim"])
+        self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
+
+    def forward(self, x, use_cache=False):
+        shortcut = x
+        x = self.norm1(x)
+        x = self.att(x, use_cache=use_cache)
+        x = self.drop_shortcut(x)
+        x = x + shortcut
+
+        shortcut = x
+        x = self.norm2(x)
+        x = self.ff(x)
+        x = self.drop_shortcut(x)
+        x = x + shortcut
+        return x
+
 
 class GPTModel(nn.Module):
     def __init__(self, cfg):
@@ -225,6 +330,50 @@ class GPTModel(nn.Module):
         logits = self.out_head(x)
         return logits
     
+    def reset_kv_cache(self):
+        for blk in self.trf_blocks:
+            blk.att.reset_cache()
+
+class GPTModel_with_KV_Cache_and_FlashAttention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
+        self.pos_emb = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
+        self.drop_emb = nn.Dropout(cfg["drop_rate"])
+
+        self.trf_blocks = nn.ModuleList([TransformerBlock_kv_cache_and_flashattn(cfg) for _ in range(cfg["n_layers"])])
+        self.ptr_current_pos = 0 
+        self.final_norm = LayerNorm(cfg["emb_dim"])
+        self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
+        self.kv_window_size = cfg["kv_window_size"] if "kv_window_size" in cfg else cfg["context_length"]
+
+    def forward(self, x, use_cache=False):
+        batch_size, seq_len = x.shape
+        tok_embeds = self.tok_emb(x)
+
+        context_length = self.pos_emb.num_embeddings
+
+        if use_cache:
+            assert self.ptr_current_pos + seq_len <= context_length,( 
+            f"position embedding overflow. want to read {self.ptr_current_pos + seq_len} which exceeded the size of {context_length}")
+
+            pos_ids = torch.arange(self.ptr_current_pos, self.ptr_current_pos + seq_len, device=x.device, dtype=torch.long)
+            self.ptr_current_pos += seq_len
+        else:
+            pos_ids = torch.arange(0, seq_len, device=x.device, dtype=torch.long)
+
+        pos_embeds = self.pos_emb(pos_ids).unsqueeze(0)
+
+        x = tok_embeds + pos_embeds
+        x = self.drop_emb(x)
+
+        for blk in self.trf_blocks:
+            x = blk(x, use_cache)
+
+        x = self.final_norm(x)
+        logits = self.out_head(x)
+        return logits
+
     def reset_kv_cache(self):
         for blk in self.trf_blocks:
             blk.att.reset_cache()
