@@ -1,5 +1,6 @@
 import tiktoken
 import torch
+from torch.cpu import is_available
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -77,8 +78,8 @@ class MultiHeadAttention(nn.Module):
         values_new = values_new.transpose(1,2)
 
         if use_cache:
-            if self.cache_k is None or self.cache_k.size[0] != b:
-                self.cache_k = torch.zeros((b,self.num_heads,num_tokens,self.head_dim))
+            if self.cache_k is None or self.cache_k.size(0) != b:
+                self.cache_k = torch.zeros((b,self.num_heads,num_tokens,self.head_dim), device=x.device)
                 self.cache_v = torch.zeros_like(self.cache_k)
                 self.ptr_cur = 0
             
@@ -195,7 +196,7 @@ class GPTModel(nn.Module):
         self.ptr_current_pos = 0 
         self.final_norm = LayerNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
-        self.window_size = cfg["kv_window_size"] if "kv_window_size" in cfg else cfg["context_length"]
+        self.kv_window_size = cfg["kv_window_size"] if "kv_window_size" in cfg else cfg["context_length"]
 
     def forward(self, x, use_cache=False):
         batch_size, seq_len = x.shape
@@ -229,17 +230,37 @@ class GPTModel(nn.Module):
             blk.att.reset_cache()
 
 
-def generate_text_simple(model, idx, max_new_tokens, context_size):
-    for _ in range(max_new_tokens):
-        idx = idx[:, -context_size:]
-        with torch.no_grad():
-            logits = model(idx)
-        logits = logits[:, -1, :]
-        probas = torch.softmax(logits, dim=-1)
-        idx_next = torch.argmax(probas, dim=-1, keepdim=True)
-        idx = torch.cat([idx, idx_next], dim=1)
+def generate_text_simple_cached(model, idx, max_new_tokens, context_size=None, use_cache=True):
+    model.eval()
 
-    return idx
+    ctx_length = context_size or model.pos_emb.num_embeddings
+    kv_window_size = model.kv_window_size
+
+    with torch.no_grad():
+        if use_cache:
+            input_tokens = idx[:, -ctx_length:]
+            input_tokens_length = input_tokens.size(1)
+
+            for i in range(0, input_tokens_length, kv_window_size):
+                idx = input_tokens[:, i:i+kv_window_size]
+                logits = model(idx, use_cache)
+
+            max_new_generable = ctx_length - model.ptr_current_pos
+            max_new_tokens = min(max_new_generable, max_new_tokens)
+
+            for _ in range(max_new_tokens):
+                nxt_tkn = logits[:, -1].argmax(dim=-1, keepdim=True)
+                idx = torch.cat([idx, nxt_tkn], dim=-1)
+                logits = model(nxt_tkn, use_cache)
+
+        else:
+            for _ in range(max_new_tokens):
+                idx = idx[:, -ctx_length:]
+                logits = model(idx)
+                nxt_tkn = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                idx = torch.cat([idx, nxt_tkn], dim=-1)
+
+        return idx
 
 def main():
     GPT_CONFIG_124M = {
@@ -249,11 +270,15 @@ def main():
         "n_heads": 12,           
         "n_layers": 12,          
         "drop_rate": 0.1,       
-        "qkv_bias": False      
+        "qkv_bias": False,   
+        "kv_window_size":1024
     }
+
 
     torch.manual_seed(123)
     model = GPTModel(GPT_CONFIG_124M)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
     model.eval()
 
     start_context = "Hello, I am"
@@ -262,11 +287,10 @@ def main():
     encoded = tokenizer.encode(start_context)
     encoded_tensor = torch.tensor(encoded).unsqueeze(0)
 
-    out = generate_text_simple(
+    out = generate_text_simple_cached(
         model=model,
         idx=encoded_tensor,
-        max_new_tokens=10,
-        context_size=GPT_CONFIG_124M["context_length"]
+        max_new_tokens=200
     )
 
     decoded_text = tokenizer.decode(out.squeeze(0).tolist())
@@ -274,6 +298,11 @@ def main():
     print("\nOutput:", out)
     print("Output length:", len(out[0]))
     print("Output text:", decoded_text)
+
+    if torch.cuda.is_available():
+        max_mem_bytes = torch.cuda.max_memory_allocated()
+        max_mem_gb = max_mem_bytes/(1024**3)
+        print(f"maximum memory allocated: {max_mem_gb:.2f} GB")
 
 
 if __name__ == "__main__":
