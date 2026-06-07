@@ -333,6 +333,7 @@ class GPTModel(nn.Module):
     def reset_kv_cache(self):
         for blk in self.trf_blocks:
             blk.att.reset_cache()
+        self.ptr_current_pos = 0
 
 class GPTModel_with_KV_Cache_and_FlashAttention(nn.Module):
     def __init__(self, cfg):
@@ -377,6 +378,7 @@ class GPTModel_with_KV_Cache_and_FlashAttention(nn.Module):
     def reset_kv_cache(self):
         for blk in self.trf_blocks:
             blk.att.reset_cache()
+        self.ptr_current_pos = 0
 
 
 def generate_text_simple_cached(model, idx, max_new_tokens, context_size=None, use_cache=True):
@@ -389,6 +391,8 @@ def generate_text_simple_cached(model, idx, max_new_tokens, context_size=None, u
         if use_cache:
             input_tokens = idx[:, -ctx_length:]
             input_tokens_length = input_tokens.size(1)
+
+            model.reset_kv_cache()
 
             for i in range(0, input_tokens_length, kv_window_size):
                 idx = input_tokens[:, i:i+kv_window_size]
