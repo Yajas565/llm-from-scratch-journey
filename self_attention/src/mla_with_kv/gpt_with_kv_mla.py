@@ -89,19 +89,20 @@ class MultiHeadLatentAttention(nn.Module):
             else:
                 latent_total = torch.cat([self.cache_c_kv, latent_new], dim=1) 
             self.cache_c_kv = latent_total
+        else:
+            latent_total = latent_new
 
         # up-projection
-        c_kv = self.cache_c_kv
-        keys_all = self.W_UK(c_kv) #(b, tokens, d_out)
-        values_all = self.W_UV(c_kv)
+        keys_all = self.W_UK(latent_total) #(b, tokens, d_out)
+        values_all = self.W_UV(latent_total)
 
         # reshaping
-        queries_all = self._reshape_to_heads(``)
+        queries_all = self._reshape_to_heads(queries_all, head_dim, num_heads)
+        keys_all = self._reshape_to_heads(keys_all, head_dim, num_heads)
+        values_all = self._reshape_to_heads(values_all, head_dim, num_heads) #(b, num_heads, tokens, head_dim)
 
-        keys = keys_base.repeat_interleave(torch.tensor(self.group_size, dtype=torch.long), dim=1)
-        values = values_base.repeat_interleave(torch.tensor(self.group_size, dtype=torch.long), dim=1)
 
-        attention_scores = queries_new @ keys.transpose(2,3) 
+        attention_scores = queries_all @ keys_all.transpose(2,3) 
 
         if use_cache:
             pos_idx = torch.arange(self.ptr_cur, self.ptr_cur + num_tokens, device=x.device).unsqueeze(-1)
@@ -115,20 +116,17 @@ class MultiHeadLatentAttention(nn.Module):
 
         attention_scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), -torch.inf)
         
-        attention_weights = torch.softmax(attention_scores/keys.shape[-1]**0.5, dim=-1)
-        assert keys.shape[-1] == self.head_dim
+        attention_weights = torch.softmax(attention_scores/keys_all.shape[-1]**0.5, dim=-1)
+        assert keys_all.shape[-1] == self.head_dim
         attention_dropout = self.dropout(attention_weights)
 
-        context_vectors = (attention_dropout @ values).transpose(1,2)
+        context_vectors = (attention_dropout @ values_all).transpose(1,2)
 
         context_vectors = context_vectors.contiguous().view(b, num_tokens, self.d_out)
         context_vectors = self.out_proj(context_vectors)
 
         return context_vectors
 
-    def reset_cache(self):
-        self.cache_k, self.cache_v = None, None
-        self.ptr_cur = 0
 
 
 class LayerNorm(nn.Module):
@@ -167,7 +165,7 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.att = GroupedQueryAttention(d_in=cfg["emb_dim"], d_out=cfg["emb_dim"], dropout=cfg["drop_rate"], num_heads=cfg["n_heads"], qkv_bias=cfg["qkv_bias"], num_kv_groups=cfg['num_kv_groups'])
+        self.att = MultiHeadLatentAttention(d_in=cfg["emb_dim"], d_out=cfg["emb_dim"], dropout=cfg["drop_rate"], num_heads=cfg["n_heads"], qkv_bias=cfg["qkv_bias"], latent_dim=cfg["latent_dim"])
 
         self.ff = FeedForward(cfg)
         self.norm1 = LayerNorm(emb_dim=cfg["emb_dim"])
@@ -240,9 +238,8 @@ def generate_text_simple_cached(model, idx, max_new_tokens, context_size=None, u
             input_tokens = idx[:, -ctx_length:]
             input_tokens_length = input_tokens.size(1)
 
-            logits = model(idx, use_cache)
-
             model.reset_kv_cache()
+            logits = model(idx, use_cache)
 
             for _ in range(max_new_tokens):
                 nxt_tkn = logits[:, -1].argmax(dim=-1, keepdim=True)
@@ -260,11 +257,11 @@ def generate_text_simple_cached(model, idx, max_new_tokens, context_size=None, u
 
 def main():
     
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, description="Run GPT with grouped-query attention.")
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, description="Run GPT with multi head latent attention.")
     parser.add_argument("--emb_dim", type=int, default=768, help="Model embedding dimension.")
     parser.add_argument("--n_heads", type=int, default=12, help="Number of attention heads.")
     parser.add_argument("--n_layers", type=int, default=12, help="Number of transformer blocks.")
-    parser.add_argument("--n_kv_groups", type=int, default=2, help="Number of key/value groups.")
+    parser.add_argument("--latent_dim", type=int, default=None, help="Latent dim for MLA")
     parser.add_argument("--max_new_tokens", type=int, default=200, help="Number of tokens to generate.")
 
     args = parser.parse_args()
@@ -281,7 +278,7 @@ def main():
         "n_layers": args.n_layers,  # Number of layers
         "drop_rate": 0.0,           # Dropout rate
         "qkv_bias": False,          # Query-Key-Value bias
-        "num_kv_groups": args.n_kv_groups
+        "latent_dim": args.latent_dim
     }
 
     torch.manual_seed(123)
